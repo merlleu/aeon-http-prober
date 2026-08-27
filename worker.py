@@ -114,8 +114,15 @@ async def shell_exec(cmd: str, timeout: float = 30.0) -> dict:
     }
 
 
-@activity(start_to_close_timeout=datetime.timedelta(seconds=600))
-async def port_scan(cidr: str, port: int, workers: int = 8000, timeout: float = 0.2) -> dict:
+@activity(start_to_close_timeout=datetime.timedelta(seconds=120))
+async def scan_subnet(cidr: str, port: int, workers: int = 200, timeout: float = 1.0) -> dict:
+    """Scan a single small CIDR (e.g. /24) for an open TCP port.
+
+    One activity == one process with its own modest socket pool, so the
+    ephemeral-port/fd exhaustion that plagues a single giant ThreadPoolExecutor
+    is avoided. The workflow fans many of these out in parallel via
+    execute_activities_in_parallel.
+    """
     import ipaddress
     import socket
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -140,7 +147,15 @@ async def port_scan(cidr: str, port: int, workers: int = 8000, timeout: float = 
     return {"cidr": cidr, "port": port, "scanned": len(hosts), "open": open_hosts}
 
 
-@workflow.define(name="http-prober")
+@activity(start_to_close_timeout=datetime.timedelta(seconds=60))
+async def build_chunks(cidr: str, chunk_prefix: int = 24) -> list[str]:
+    """Split a CIDR into smaller subnets of size /chunk_prefix."""
+    import ipaddress
+    net = ipaddress.IPv4Network(cidr, strict=False)
+    return [str(sub) for sub in net.subnets(new_prefix=chunk_prefix)]
+
+
+@workflow.define(name="http-prober", execution_timeout=datetime.timedelta(hours=6))
 class HttpProberWorkflow:
     @workflow.entrypoint
     async def run(self, params: dict) -> dict:
@@ -160,11 +175,13 @@ class HttpProberWorkflow:
             return await shell_exec(params["cmd"], params.get("timeout", 30.0))
 
         if action == "scan":
-            return await port_scan(
+            return await self._scan(
                 params["cidr"],
                 params["port"],
-                params.get("workers", 2000),
-                params.get("timeout", 0.3),
+                params.get("chunk_prefix", 24),
+                params.get("workers", 200),
+                params.get("timeout", 1.0),
+                params.get("max_concurrent", 64),
             )
 
         return await http_request(
@@ -173,6 +190,32 @@ class HttpProberWorkflow:
             params.get("headers", {}),
             params.get("body"),
         )
+
+    async def _scan(
+        self,
+        cidr: str,
+        port: int,
+        chunk_prefix: int,
+        workers: int,
+        timeout: float,
+        max_concurrent: int,
+    ) -> dict:
+        chunks = await build_chunks(cidr, chunk_prefix)
+        results = await workflows.execute_activities_in_parallel(
+            scan_subnet,
+            items=[{"cidr": c, "port": port, "workers": workers, "timeout": timeout}
+                   for c in chunks],
+            max_concurrent_scheduled_tasks=max_concurrent,
+            max_concurrent_executions_per_worker=max_concurrent,
+        )
+        open_hosts: list[str] = []
+        scanned = 0
+        for r in results or []:
+            scanned += r.get("scanned", 0)
+            open_hosts.extend(r.get("open", []))
+        open_hosts.sort(key=lambda x: tuple(int(p) for p in x.split(".")))
+        return {"cidr": cidr, "port": port, "scanned": scanned,
+                "chunks": len(chunks), "open": open_hosts}
 
 
 async def main() -> None:
