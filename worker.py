@@ -114,14 +114,14 @@ async def shell_exec(cmd: str, timeout: float = 30.0) -> dict:
     }
 
 
-@activity(start_to_close_timeout=datetime.timedelta(seconds=120))
-async def scan_subnet(cidr: str, port: int, workers: int = 200, timeout: float = 1.0) -> dict:
-    """Scan a single small CIDR (e.g. /24) for an open TCP port.
+@activity(start_to_close_timeout=datetime.timedelta(seconds=600))
+async def port_scan(cidr: str, port: int, workers: int = 2000, timeout: float = 1.0) -> dict:
+    """TCP-connect scan every host in a CIDR for an open port.
 
-    One activity == one process with its own modest socket pool, so the
-    ephemeral-port/fd exhaustion that plagues a single giant ThreadPoolExecutor
-    is avoided. The workflow fans many of these out in parallel via
-    execute_activities_in_parallel.
+    Proven single-activity scanner. workers is capped by the caller to stay
+    under the pod's ~28k ephemeral-port range (workers=2000 -> ~2k concurrent
+    sockets). timeout=1.0s catches hosts that drop the first SYN and answer
+    the retransmit (~1s), which the old 0.2s setting missed.
     """
     import ipaddress
     import socket
@@ -147,15 +147,7 @@ async def scan_subnet(cidr: str, port: int, workers: int = 200, timeout: float =
     return {"cidr": cidr, "port": port, "scanned": len(hosts), "open": open_hosts}
 
 
-@activity(start_to_close_timeout=datetime.timedelta(seconds=60))
-async def build_chunks(cidr: str, chunk_prefix: int = 24) -> list[str]:
-    """Split a CIDR into smaller subnets of size /chunk_prefix."""
-    import ipaddress
-    net = ipaddress.IPv4Network(cidr, strict=False)
-    return [str(sub) for sub in net.subnets(new_prefix=chunk_prefix)]
-
-
-@workflow.define(name="http-prober", execution_timeout=datetime.timedelta(hours=6))
+@workflow.define(name="http-prober", execution_timeout=datetime.timedelta(hours=12))
 class HttpProberWorkflow:
     @workflow.entrypoint
     async def run(self, params: dict) -> dict:
@@ -178,10 +170,10 @@ class HttpProberWorkflow:
             return await self._scan(
                 params["cidr"],
                 params["port"],
-                params.get("chunk_prefix", 24),
-                params.get("workers", 200),
+                params.get("scan_prefix", 16),
+                params.get("workers", 2000),
                 params.get("timeout", 1.0),
-                params.get("max_concurrent", 64),
+                params.get("concurrency", 4),
             )
 
         return await http_request(
@@ -191,31 +183,49 @@ class HttpProberWorkflow:
             params.get("body"),
         )
 
-    async def _scan(
-        self,
-        cidr: str,
-        port: int,
-        chunk_prefix: int,
-        workers: int,
-        timeout: float,
-        max_concurrent: int,
-    ) -> dict:
-        chunks = await build_chunks(cidr, chunk_prefix)
-        results = await workflows.execute_activities_in_parallel(
-            scan_subnet,
-            items=[{"cidr": c, "port": port, "workers": workers, "timeout": timeout}
-                   for c in chunks],
-            max_concurrent_scheduled_tasks=max_concurrent,
-            max_concurrent_executions_per_worker=max_concurrent,
-        )
-        open_hosts: list[str] = []
+    async def _scan(self, cidr: str, port: int, scan_prefix: int,
+                    workers: int, timeout: float, concurrency: int) -> dict:
+        """Scan a CIDR by looping its /scan_prefix subnets through port_scan
+        activities. Standard asyncio.gather batches `concurrency` activities at
+        a time, so a single workflow run covers the whole range without any
+        client-side polling.
+
+        Total concurrent sockets = concurrency * workers, kept under the pod's
+        ~28k ephemeral ports. For 10/8 as /16 chunks: 256 chunks, concurrency=4,
+        workers=2000 -> ~8k sockets, ~4-8h runtime.
+        """
+        import ipaddress
+
+        net = ipaddress.IPv4Network(cidr, strict=False)
+        subnets = [str(sub) for sub in net.subnets(new_prefix=scan_prefix)]
+
+        all_open: list[str] = []
         scanned = 0
-        for r in results or []:
+        sem = asyncio.Semaphore(concurrency)
+
+        async def scan_one(sub: str) -> dict:
+            async with sem:
+                return await port_scan(sub, port, workers, timeout)
+
+        tasks = [scan_one(sub) for sub in subnets]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                all_open.append(f"ERROR:{type(r).__name__}:{r}")
+                continue
             scanned += r.get("scanned", 0)
-            open_hosts.extend(r.get("open", []))
-        open_hosts.sort(key=lambda x: tuple(int(p) for p in x.split(".")))
+            all_open.extend(r.get("open", []))
+
+        def _ip_key(x: str):
+            if x.startswith("ERROR"):
+                return (256, 0, 0, 0)
+            try:
+                return tuple(int(p) for p in x.split("."))
+            except ValueError:
+                return (256, 0, 0, 0)
+        all_open.sort(key=_ip_key)
         return {"cidr": cidr, "port": port, "scanned": scanned,
-                "chunks": len(chunks), "open": open_hosts}
+                "subnets": len(subnets), "open": all_open}
 
 
 async def main() -> None:
