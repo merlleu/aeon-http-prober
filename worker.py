@@ -114,8 +114,8 @@ async def shell_exec(cmd: str, timeout: float = 30.0) -> dict:
     }
 
 
-@activity(start_to_close_timeout=datetime.timedelta(seconds=120))
-async def port_scan(cidr: str, port: int, workers: int = 2000, timeout: float = 0.3) -> dict:
+@activity(start_to_close_timeout=datetime.timedelta(seconds=600))
+async def port_scan(cidr: str, port: int, workers: int = 8000, timeout: float = 0.2) -> dict:
     import ipaddress
     import socket
     from concurrent.futures import ThreadPoolExecutor, as_completed
