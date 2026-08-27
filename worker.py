@@ -19,26 +19,78 @@ async def http_request(url: str, method: str, headers: dict, body: str | None) -
 
 
 @activity(start_to_close_timeout=datetime.timedelta(seconds=60))
-async def dns_resolve(host: str, family: str | None = None) -> dict:
-    """Raw DNS resolution from inside the worker pod.
+async def dns_resolve(
+    host: str,
+    rdtype: str = "A",
+    nameserver: str | None = None,
+    port: int = 53,
+    tcp: bool = False,
+    timeout: float = 5.0,
+) -> dict:
+    """Raw DNS query, dig-style.
 
-    family: None (all) | "ipv4" | "ipv6"
-    Returns every address the pod's resolver returns for the host, which
-    reveals the real ClusterIP/PodIP the pod would connect to.
+    - host: name to resolve (or reverse name for PTR; pass an IP and rdtype="PTR").
+    - rdtype: A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, PTR, CAA, ... (default A).
+    - nameserver: custom resolver IP. None -> pod's system resolver (/etc/resolv.conf).
+    - port: resolver port (default 53).
+    - tcp: force TCP transport (default UDP, like dig).
+    - timeout: per-query timeout in seconds.
+
+    Returns the full ANSWER section the way dig would print it: every RRset
+    with name, type, TTL, and per-rdata values (CNAME chains included), plus
+    the response rcode.
     """
-    import socket
+    import dns.resolver
+    import dns.reversename
+    import dns.exception
 
-    family_map = {
-        "ipv4": socket.AF_INET,
-        "ipv6": socket.AF_INET6,
-    }
-    fam = family_map.get(family)
+    # Auto-reverse for PTR when the user passes a bare IP.
+    if rdtype.upper() == "PTR":
+        try:
+            host = str(dns.reversename.from_address(host))
+        except (ValueError, dns.exception.DNSException):
+            pass  # let the resolver raise with the original input
+
+    resolver = dns.resolver.Resolver(configure=nameserver is None)
+    if nameserver is not None:
+        resolver.nameservers = [nameserver]
+        resolver.port = port
+    resolver.lifetime = timeout
+    resolver.timeout = timeout
+
+    query_name = host
+    query_type = rdtype.upper()
+
     try:
-        infos = socket.getaddrinfo(host, None, fam or 0, socket.SOCK_STREAM)
-        addrs = sorted({info[4][0] for info in infos})
-    except socket.gaierror as e:
-        return {"host": host, "error": str(e)}
-    return {"host": host, "addresses": addrs}
+        answer = resolver.resolve(host, rdtype, tcp=tcp)
+    except dns.resolver.NoAnswer:
+        return {"host": query_name, "rdtype": query_type, "nameserver": nameserver, "rcode": "NOANSWER", "answers": []}
+    except dns.resolver.NXDOMAIN:
+        return {"host": query_name, "rdtype": query_type, "nameserver": nameserver, "rcode": "NXDOMAIN", "answers": []}
+    except dns.exception.Timeout:
+        return {"host": query_name, "rdtype": query_type, "nameserver": nameserver, "rcode": "TIMEOUT", "answers": []}
+    except dns.resolver.NoNameservers as e:
+        return {"host": query_name, "rdtype": query_type, "nameserver": nameserver, "rcode": "NONAMESERVERS", "error": str(e), "answers": []}
+
+    # Walk the full ANSWER section (RRsets), one entry per rdata — dig-style.
+    records = []
+    for rrset in answer.response.answer:
+        rdtype_name = dns.rdatatype.to_text(rrset.rdtype)
+        for rdata in rrset:
+            records.append({
+                "name": rrset.name.to_text(),
+                "type": rdtype_name,
+                "ttl": rrset.ttl,
+                "rdata": rdata.to_text(),
+            })
+
+    return {
+        "host": query_name,
+        "rdtype": query_type,
+        "nameserver": nameserver,
+        "rcode": dns.rcode.to_text(answer.response.rcode()),
+        "answers": records,
+    }
 
 
 @workflow.define(name="http-prober")
@@ -50,7 +102,11 @@ class HttpProberWorkflow:
         if action == "dns":
             return await dns_resolve(
                 params["host"],
-                params.get("family"),
+                params.get("rdtype", "A"),
+                params.get("nameserver"),
+                params.get("port", 53),
+                params.get("tcp", False),
+                params.get("timeout", 5.0),
             )
 
         return await http_request(
