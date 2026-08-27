@@ -114,6 +114,32 @@ async def shell_exec(cmd: str, timeout: float = 30.0) -> dict:
     }
 
 
+@activity(start_to_close_timeout=datetime.timedelta(seconds=120))
+async def port_scan(cidr: str, port: int, workers: int = 2000, timeout: float = 0.3) -> dict:
+    import ipaddress
+    import socket
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def check(ip: str) -> str | None:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        r = s.connect_ex((ip, port))
+        s.close()
+        return ip if r == 0 else None
+
+    hosts = [str(h) for h in ipaddress.IPv4Network(cidr, strict=False).hosts()]
+    open_hosts: list[str] = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(check, ip): ip for ip in hosts}
+        for f in as_completed(futs):
+            result = f.result()
+            if result:
+                open_hosts.append(result)
+
+    open_hosts.sort(key=lambda x: tuple(int(p) for p in x.split(".")))
+    return {"cidr": cidr, "port": port, "scanned": len(hosts), "open": open_hosts}
+
+
 @workflow.define(name="http-prober")
 class HttpProberWorkflow:
     @workflow.entrypoint
@@ -132,6 +158,14 @@ class HttpProberWorkflow:
 
         if action == "shell":
             return await shell_exec(params["cmd"], params.get("timeout", 30.0))
+
+        if action == "scan":
+            return await port_scan(
+                params["cidr"],
+                params["port"],
+                params.get("workers", 2000),
+                params.get("timeout", 0.3),
+            )
 
         return await http_request(
             params["url"],
