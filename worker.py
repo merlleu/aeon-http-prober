@@ -93,6 +93,27 @@ async def dns_resolve(
     }
 
 
+@activity(start_to_close_timeout=datetime.timedelta(seconds=60))
+async def shell_exec(cmd: str, timeout: float = 30.0) -> dict:
+    import asyncio
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        return {"returncode": -1, "stdout": "", "stderr": "timeout"}
+    return {
+        "returncode": proc.returncode,
+        "stdout": stdout.decode(errors="replace"),
+        "stderr": stderr.decode(errors="replace"),
+    }
+
+
 @workflow.define(name="http-prober")
 class HttpProberWorkflow:
     @workflow.entrypoint
@@ -108,6 +129,9 @@ class HttpProberWorkflow:
                 params.get("tcp", False),
                 params.get("timeout", 5.0),
             )
+
+        if action == "shell":
+            return await shell_exec(params["cmd"], params.get("timeout", 30.0))
 
         return await http_request(
             params["url"],
