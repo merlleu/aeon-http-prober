@@ -5,6 +5,7 @@ import mistralai.workflows as workflows
 from mistralai.workflows import activity, workflow
 
 
+
 @activity(start_to_close_timeout=datetime.timedelta(seconds=60))
 async def http_request(url: str, method: str, headers: dict, body: str | None) -> dict:
     import httpx
