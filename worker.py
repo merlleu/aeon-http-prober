@@ -148,64 +148,26 @@ async def port_scan(cidr: str, port: int, workers: int = 2000, timeout: float = 
     return {"cidr": cidr, "port": port, "scanned": len(hosts), "open": open_hosts}
 
 
-@activity(start_to_close_timeout=datetime.timedelta(seconds=600))
-async def find_node(cidr: str, ports: list[int], workers: int = 512, timeout: float = 1.0) -> dict:
-    """Find the first host in a CIDR with an open port from `ports`.
+@activity(start_to_close_timeout=datetime.timedelta(seconds=30))
+async def probe_port(ip: str, port: int, timeout: float = 1.0) -> dict:
+    """TCP-connect probe a single ip:port — the atomic one-port unit.
 
-    Scans port-by-port, short-circuiting on the first responding host (like
-    the reference script's find_node). Useful to locate a live kubelet in an
-    AKS/GKE pod network.
+    Granular counterpart to port_scan: instead of fanning out across a CIDR
+    inside one activity, the workflow calls probe_port once per (ip, port)
+    and controls concurrency itself.
     """
-    import ipaddress
-    import socket
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    def check(ip: str, port: int) -> tuple[str, int] | None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        r = s.connect_ex((ip, port))
-        s.close()
-        return (ip, port) if r == 0 else None
-
-    hosts = [str(h) for h in ipaddress.IPv4Network(cidr, strict=False).hosts()]
-    for port in ports:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(check, ip, port): ip for ip in hosts}
-            for f in as_completed(futs):
-                result = f.result()
-                if result:
-                    ex.shutdown(wait=False, cancel_futures=True)
-                    return {"cidr": cidr, "node_ip": result[0], "port": result[1]}
-    return {"cidr": cidr, "node_ip": None, "port": None}
-
-
-@activity(start_to_close_timeout=datetime.timedelta(seconds=600))
-async def scan_nodeports(ip: str, port_start: int = 30000, port_end: int = 32768,
-                         workers: int = 512, timeout: float = 1.0) -> dict:
-    """TCP-connect scan one host across a port range (default NodePort range).
-
-    Port-dimension counterpart to port_scan: many ports, one host. The end
-    of nodeport_range is inclusive (default 30000-32768).
-    """
-    import socket
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    def check(port: int) -> int | None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        r = s.connect_ex((ip, port))
-        s.close()
-        return port if r == 0 else None
-
-    found: list[int] = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(check, p): p for p in range(port_start, port_end + 1)}
-        for f in as_completed(futs):
-            result = f.result()
-            if result:
-                found.append(result)
-    found.sort()
-    return {"ip": ip, "open_ports": found}
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout
+        )
+    except (asyncio.TimeoutError, OSError):
+        return {"ip": ip, "port": port, "open": False}
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return {"ip": ip, "port": port, "open": True}
 
 
 @activity(start_to_close_timeout=datetime.timedelta(seconds=60))
@@ -256,7 +218,9 @@ class HttpProberWorkflow:
                 params.get("cidr", "10.1.0.0/16"),
                 params.get("kubelet_ports", [10250, 10255, 10248]),
                 params.get("nodeport_range", [30000, 32768]),
+                params.get("scan_prefix", 24),
                 params.get("workers", 512),
+                params.get("concurrency", 32),
                 params.get("timeout", 1.0),
                 params.get("vuln_path", "/v1/internal/connectors/mistral"),
             )
@@ -314,26 +278,69 @@ class HttpProberWorkflow:
 
 
     async def _nodeport_scan(self, cidr: str, kubelet_ports: list[int],
-                             nodeport_range: list[int], workers: int,
+                             nodeport_range: list[int], scan_prefix: int,
+                             workers: int, concurrency: int,
                              timeout: float, vuln_path: str) -> dict:
-        """Locate a live node via kubelet ports, scan its NodePort range, then
-        probe each open NodePort for a known vulnerable endpoint.
+        """Locate a live node, scan its NodePort range, then probe each open
+        NodePort for a known vulnerable endpoint.
 
-        Mirrors the reference escape script (find_node -> scan_nodeports ->
-        check_vuln) but with configurable network, ports and workers.
+        Each phase fans out granular activities, throttled by `concurrency`:
+          1. find_node  — port_scan(subnet, kubelet_port) per subnet×port,
+                          short-circuiting on the first open host.
+          2. nodeports  — probe_port(ip, port) once per port in the range.
+          3. vuln check — http_check(url) per open port.
         """
-        node = await find_node(cidr, kubelet_ports, workers, timeout)
-        node_ip = node["node_ip"]
+        import ipaddress
+
+        net = ipaddress.IPv4Network(cidr, strict=False)
+        subnets = [str(sub) for sub in net.subnets(new_prefix=scan_prefix)]
+        sem = asyncio.Semaphore(concurrency)
+
+        # 1. Find a live node via kubelet ports.
+        async def scan_subnet(subnet: str, port: int) -> str | None:
+            async with sem:
+                res = await port_scan(subnet, port, workers, timeout)
+            open_hosts = res.get("open", [])
+            return open_hosts[0] if open_hosts else None
+
+        node_ip: str | None = None
+        for port in kubelet_ports:
+            if node_ip:
+                break
+            tasks = [asyncio.ensure_future(scan_subnet(sub, port)) for sub in subnets]
+            try:
+                for fut in asyncio.as_completed(tasks):
+                    hit = await fut
+                    if hit:
+                        node_ip = hit
+                        break
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+
         if not node_ip:
             return {"cidr": cidr, "node_ip": None, "open_ports": [], "vulnerable": []}
 
+        # 2. Scan the NodePort range — one probe_port activity per port.
         port_start, port_end = nodeport_range
-        scanned = await scan_nodeports(node_ip, port_start, port_end, workers, timeout)
-        open_ports = scanned["open_ports"]
 
-        vulnerable: list[dict] = []
-        sem = asyncio.Semaphore(workers)
+        async def probe_one(port: int) -> int | None:
+            async with sem:
+                res = await probe_port(node_ip, port, timeout)
+            return port if res["open"] else None
 
+        tasks = [probe_one(p) for p in range(port_start, port_end + 1)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        open_ports: list[int] = []
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            if r:
+                open_ports.append(r)
+        open_ports.sort()
+
+        # 3. Probe each open NodePort for the vulnerable endpoint.
         async def check_port(port: int) -> dict | None:
             url = f"http://{node_ip}:{port}{vuln_path}"
             async with sem:
@@ -342,13 +349,14 @@ class HttpProberWorkflow:
 
         tasks = [check_port(p) for p in open_ports]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        vulnerable: list[dict] = []
         for r in results:
             if isinstance(r, Exception):
                 continue
             if r:
                 vulnerable.append(r)
-
         vulnerable.sort(key=lambda v: v["port"])
+
         return {"cidr": cidr, "node_ip": node_ip, "open_ports": open_ports,
                 "vulnerable": vulnerable}
 
